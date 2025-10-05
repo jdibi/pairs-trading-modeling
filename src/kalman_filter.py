@@ -260,4 +260,209 @@ def estimate_ar1_kalman(
     params_ar1 = {"c": c, "a": a, "Q": Q, "R": R, "x0": x0, "P0": P0}
 
     # Map to OU (only valid if |a|<1 and a>0 is expected for mean-reversion)
-    a_clip = np.clip(a,
+    a_clip = np.clip(a, 1e-9, 1 - 1e-9)
+    theta = -np.log(a_clip) / dt
+    mu = c / (1.0 - a_clip)
+    sigma_sq = 2.0 * theta * Q / (1.0 - a_clip ** 2)
+    sigma = float(np.sqrt(max(sigma_sq, 1e-12)))
+
+    params_ou = {"mu": float(mu), "theta": float(theta), "sigma": sigma, "dt": float(dt)}
+    return params_ar1, params_ou
+
+
+# ---------------------------------------------------------------------------
+# 3) Two-regime switching Kalman filter (forward probabilities)
+# ---------------------------------------------------------------------------
+class SwitchingKalman2:
+    """Two-regime linear-Gaussian model with fixed AR(1) params per regime.
+
+    For regime j ∈ {0,1}:
+        x_t = c_j + a_j x_{t-1} + w_t,  w_t ~ N(0, Q_j)
+        y_t = x_t + v_t,                v_t ~ N(0, R_j)
+
+    Regime S_t follows a Markov chain with transition matrix P (2x2).
+
+    This class computes filtered probabilities p(S_t=j | y_{0:t}) and returns
+    the most likely regime path (argmax) as a convenience.
+    """
+
+    def __init__(
+        self,
+        *,
+        c: Tuple[float, float],
+        a: Tuple[float, float],
+        Q: Tuple[float, float],
+        R: Tuple[float, float],
+        P: np.ndarray,  # shape (2,2)
+        x0: float = 0.0,
+        P0: float = 1.0,
+        pi0: Optional[np.ndarray] = None,
+    ):
+        self.c = np.array(c, dtype=float)
+        self.a = np.array(a, dtype=float)
+        self.Q = np.array(Q, dtype=float)
+        self.R = np.array(R, dtype=float)
+        self.P = np.asarray(P, dtype=float)
+        if self.P.shape != (2, 2):
+            raise ValueError("P must be 2x2")
+        if pi0 is None:
+            # stationary distribution of P
+            p01 = self.P[0, 1]
+            p10 = self.P[1, 0]
+            denom = p01 + p10
+            if denom > 0:
+                pi0 = np.array([p10 / denom, p01 / denom])
+            else:
+                pi0 = np.array([0.5, 0.5])
+        self.pi0 = np.asarray(pi0, dtype=float)
+        self.x0 = float(x0)
+        self.P0 = float(P0)
+
+    def filter(self, y: np.ndarray | pd.Series) -> Dict[str, Any]:
+        y = np.asarray(y, dtype=float).ravel()
+        T = y.size
+
+        # Per-regime filtered states and variances
+        x = np.zeros((T, 2))
+        V = np.zeros((T, 2))
+        ll = 0.0
+
+        # Regime probabilities
+        p_filt = np.zeros((T, 2))
+        p_prev = self.pi0.copy()
+
+        # Initialize state means for each regime equally
+        x_prev = np.array([self.x0, self.x0], dtype=float)
+        V_prev = np.array([self.P0, self.P0], dtype=float)
+
+        for t in range(T):
+            # Interact (mix) prior over regimes
+            p_pred = p_prev @ self.P  # shape (2,)
+
+            x_pred = np.empty(2)
+            V_pred = np.empty(2)
+            like = np.empty(2)
+
+            for j in range(2):
+                c, a, Q, R = self.c[j], self.a[j], self.Q[j], self.R[j]
+                # Predict
+                xj_pred = c + a * x_prev[j]
+                Vj_pred = a * V_prev[j] * a + Q
+                # Update
+                Sj = Vj_pred + R
+                Kj = Vj_pred / Sj
+                innov = y[t] - xj_pred
+                xj_new = xj_pred + Kj * innov
+                Vj_new = (1.0 - Kj) * Vj_pred
+
+                x_pred[j] = xj_new
+                V_pred[j] = Vj_new
+                like[j] = (1.0 / np.sqrt(2 * np.pi * Sj)) * np.exp(-0.5 * innov ** 2 / Sj)
+
+            # Regime update via Bayes
+            numer = p_pred * like
+            denom = numer.sum()
+            if denom <= 0:
+                numer = np.maximum(numer, 1e-300)
+                denom = numer.sum()
+            p_curr = numer / denom
+            ll += np.log(denom)
+
+            # Save
+            x[t, :] = x_pred
+            V[t, :] = V_pred
+            p_filt[t, :] = p_curr
+
+            # Prepare next step: set regime-conditional states as current
+            x_prev, V_prev = x_pred, V_pred
+            p_prev = p_curr
+
+        most_likely = p_filt.argmax(axis=1)
+        return {
+            "x_filt": x,          # shape (T,2)
+            "V_filt": V,          # shape (T,2)
+            "p_filt": p_filt,     # shape (T,2)
+            "regime": most_likely,  # argmax path
+            "loglik": float(ll),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Helper: map OU params to AR(1) (c, a, Q) given dt
+# ---------------------------------------------------------------------------
+
+def ou_to_ar1(mu: float, theta: float, sigma: float, dt: float) -> Tuple[float, float, float]:
+    """Exact discretization mapping OU -> AR(1) with Gaussian innovations.
+
+    X_{t+1} = c + a X_t + eps,  eps ~ N(0, Q)
+    a = exp(-theta*dt)
+    c = mu * (1 - a)
+    Q = (sigma^2 / (2*theta)) * (1 - a^2)
+    """
+    a = float(np.exp(-theta * dt))
+    c = float(mu * (1.0 - a))
+    if theta <= 0:
+        raise ValueError("theta must be > 0 for OU mapping")
+    Q = float((sigma ** 2) / (2.0 * theta) * (1.0 - a ** 2))
+    return c, a, Q
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    rng = np.random.default_rng(0)
+    T = 2000
+
+    # Generate AR(1)+noise, then estimate via EM
+    a_true = 0.99
+    c_true = 0.0
+    Q_true = 1e-4
+    R_true = 1e-3
+
+    x = np.zeros(T)
+    y = np.zeros(T)
+    x[0] = 0.5
+    for t in range(1, T):
+        x[t] = c_true + a_true * x[t-1] + rng.normal(scale=np.sqrt(Q_true))
+    y = x + rng.normal(scale=np.sqrt(R_true), size=T)
+
+    ar1_hat, ou_hat = estimate_ar1_kalman(y, dt=1/252)
+    print("AR1 hat:", ar1_hat)
+    print("OU hat:", ou_hat)
+
+    # Switching demo
+    dt = 1/252
+    mu1, th1, sg1 = 0.0, 5.0, 0.4
+    mu2, th2, sg2 = 1.0, 1.0, 0.8
+    c1, a1, Q1 = ou_to_ar1(mu1, th1, sg1, dt)
+    c2, a2, Q2 = ou_to_ar1(mu2, th2, sg2, dt)
+    R = 1e-6  # assume negligible measurement noise on spread
+
+    # Simulate switching AR(1)
+    P = np.array([[0.98, 0.02],[0.05, 0.95]])
+    s = np.zeros(T, dtype=int)
+    for t in range(1, T):
+        s[t] = 0 if (s[t-1] == 0 and rng.random() < P[0,0]) else (1 if s[t-1]==0 else (1 if rng.random() < P[1,1] else 0))
+    x = np.zeros(T)
+    for t in range(1, T):
+        if s[t] == 0:
+            x[t] = c1 + a1 * x[t-1] + rng.normal(scale=np.sqrt(Q1))
+        else:
+            x[t] = c2 + a2 * x[t-1] + rng.normal(scale=np.sqrt(Q2))
+    y = x + rng.normal(scale=np.sqrt(R), size=T)
+
+    sw = SwitchingKalman2(c=(c1,c2), a=(a1,a2), Q=(Q1,Q2), R=(R,R), P=P, x0=0.0, P0=1.0)
+    res = sw.filter(y)
+    print("Switching loglik:", res["loglik"]) 
+    print("Regime accuracy (argmax):", (res["regime"] == s).mean())
+
+    # Simple plot
+    plt.figure()
+    plt.plot(y, label="obs spread", alpha=0.6)
+    plt.plot(res["x_filt"][:,0]*res["p_filt"][:,0] + res["x_filt"][:,1]*res["p_filt"][:,1], label="filtered x (mix)")
+    plt.legend()
+    plt.title("Switching Kalman – filtered state")
+    plt.show()
